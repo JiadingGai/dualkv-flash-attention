@@ -10,7 +10,7 @@ from flash_attn.layers.rotary import apply_rotary_emb
 dtype = torch.float16
 device = "cuda"
 
-def plot_latency_csv(latency_csv):
+def plot_latency_csv_old(latency_csv):
     import matplotlib.pyplot as plt
     for c, b, f in latency_csv:
         print(c, ",", b, ",", f)
@@ -24,6 +24,56 @@ def plot_latency_csv(latency_csv):
     plt.plot(ctx_, fa2_, "g^--", label="FA", markersize=3.0, linewidth=1)
     plt.legend()
     plt.savefig("__plot_timing.png", dpi=600)
+
+def plot_latency_csv(latency_csv, out_path="__plot_latency_combined.png",
+                     title="BA+FA vs FA: attention kernel latency comparison"):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    # unpack & sort
+    ctx = np.array([x[0] for x in latency_csv], dtype=np.int64)
+    ba_us = np.array([x[1] for x in latency_csv], dtype=np.float64)
+    fa_us = np.array([x[2] for x in latency_csv], dtype=np.float64)
+    order = np.argsort(ctx)
+    ctx, ba_us, fa_us = ctx[order], ba_us[order], fa_us[order]
+
+    # μs → ms
+    ba_ms = ba_us / 1000.0
+    fa_ms = fa_us / 1000.0
+
+    # combined figure
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    thous = FuncFormatter(lambda x, _: f"{int(x):,}")
+
+    # 1) Latency subplot
+    ax1.plot(ctx, ba_ms, "^--", label="BA+FA", markersize=3.5, linewidth=1)
+    ax1.plot(ctx, fa_ms, "o--", label="FA",    markersize=3.5, linewidth=1)
+    ax1.set_ylabel("Latency (ms)")
+    ax1.set_title(title)
+    ax1.yaxis.set_major_formatter(thous)
+    ax1.grid(True, which="both", alpha=0.25)
+    ax1.legend()
+
+    # OLS slope (ms/token) — prints in console
+    import numpy as np
+    b_ba, a_ba = np.polyfit(ctx, ba_ms, 1)
+    b_fa, a_fa = np.polyfit(ctx, fa_ms, 1)
+    print(f"[fit] BA+FA: latency ≈ {a_ba:.3f} + {b_ba:.6f}·ctx (ms)")
+    print(f"[fit] FA   : latency ≈ {a_fa:.3f} + {b_fa:.6f}·ctx (ms)")
+    print(f"[fit] slope ratio (FA/BA+FA): {b_fa / max(b_ba, 1e-12):.2f}×")
+
+    # 2) Speedup subplot — bigger dots
+    speedup = np.divide(fa_ms, np.maximum(ba_ms, 1e-12))
+    ax2.scatter(ctx, speedup, s=24, marker="o", alpha=0.85)  # bigger & clearer
+    ax2.set_xlabel("Cache Context Length")
+    ax2.set_ylabel("Speedup (FA / BA+FA)")
+    ax2.xaxis.set_major_formatter(thous)
+    ax2.grid(True, which="both", alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+
 
 class TestFlashFwdDualkvAttention:
     @pytest.mark.parametrize("dtype", [torch.float16])
