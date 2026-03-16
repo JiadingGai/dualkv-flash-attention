@@ -63,7 +63,11 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+    // DualKV: context and decoded occupy separate block ranges (each padded to kBlockN).
+    // Use physical block count instead of ceil(seqlen_k/kBlockN) to avoid undercounting.
+    const int physical_total_blocks = ((params.seqlen_k_context + kBlockN - 1) / kBlockN)
+                                    + ((params.seqlen_k_decoded + kBlockN - 1) / kBlockN);
+    const int n_blocks_per_split = (physical_total_blocks + num_n_splits - 1) / num_n_splits;
     const int n_block_min = !Is_local
         ? n_split_idx * n_blocks_per_split
         : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
@@ -180,11 +184,15 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
                                         (bidh / params.h_h_k_ratio) * params.vcontext_head_stride;
 
     assert(n_block_max_decoded > 0);
+    // Clamp decoded block index to >= 0. When n_block_max <= actual_n_block_max_context
+    // (this split only covers context blocks), the subtraction goes negative.
+    // In that case we set the offset to block 0 — the pointer won't be dereferenced.
+    const int decoded_block_idx = std::max(0, std::min(n_block_max - actual_n_block_max_context, actual_n_block_max_decoded) - 1);
     const index_t row_offset_kdecoded = binfo.k_offset(params.kdecoded_batch_stride, params.kdecoded_row_stride, bidb_cache) +
-                                        (std::min(n_block_max - actual_n_block_max_context, actual_n_block_max_decoded) - 1) * kBlockN * params.kdecoded_row_stride +
+                                        decoded_block_idx * kBlockN * params.kdecoded_row_stride +
                                         (bidh / params.h_h_k_ratio) * params.kdecoded_head_stride;
     const index_t row_offset_vdecoded = binfo.k_offset(params.vdecoded_batch_stride, params.vdecoded_row_stride, bidb_cache) +
-                                        (std::min(n_block_max - actual_n_block_max_context, actual_n_block_max_decoded) - 1) * kBlockN * params.vdecoded_row_stride +
+                                        decoded_block_idx * kBlockN * params.vdecoded_row_stride +
                                         (bidh / params.h_h_k_ratio) * params.vdecoded_head_stride;
 
 
@@ -384,8 +392,8 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
             }
             tKgKnew.data() = tKgKnew.data() + (-int(kBlockN * params.knew_row_stride));
             if (block_table == nullptr) {
-                tVgVdecoded.data() = tVgVdecoded.data() + (-int(kBlockN * params.v_row_stride));
-                tKgKdecoded.data() = tKgKdecoded.data() + (-int(kBlockN * params.k_row_stride));
+                tVgVdecoded.data() = tVgVdecoded.data() + (-int(kBlockN * params.vdecoded_row_stride));
+                tKgKdecoded.data() = tKgKdecoded.data() + (-int(kBlockN * params.kdecoded_row_stride));
             } else {
 #ifndef DUALKV_ATTENTION_DISABLE_UNSUPPORTED_CODE
                 if (n_block > n_block_copy_min) {
@@ -513,7 +521,7 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
         );
       } else if (n_block < (actual_n_block_max_context - 1)) {
         if (block_table == nullptr) {
-            tVgVcontext.data() = tVgVcontext.data() + (-int(kBlockN * params.v_row_stride));
+            tVgVcontext.data() = tVgVcontext.data() + (-int(kBlockN * params.vcontext_row_stride));
         } else {
 #ifndef DUALKV_ATTENTION_DISABLE_UNSUPPORTED_CODE
                 const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
@@ -526,14 +534,14 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgVcontext, tVsV, tKVcKV, tKVpKV);
       } else {
         if (block_table == nullptr) {
-            tVgVdecoded.data() = tVgVdecoded.data() + (-int(kBlockN * params.v_row_stride));
+            tVgVdecoded.data() = tVgVdecoded.data() + (-int(kBlockN * params.vdecoded_row_stride));
         } else {
 #ifndef DUALKV_ATTENTION_DISABLE_UNSUPPORTED_CODE
                 const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
                 const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
                 const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
                 const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
-                tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+                tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.vdecoded_row_stride;
 #endif
         }
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgVdecoded, tVsV, tKVcKV, tKVpKV);
@@ -561,11 +569,12 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
             // isn't right and we get race conditions.
             cute::cp_async_fence();
         } else if (n_block == actual_n_block_max_context) {
-            //assert(n_block == n_block_max_context &&
-            //       "[DUALKV ATTENTION] You are at the last decoded block, but block index does not match.");
-            flash::copy</*Is_even_MN=*/true, Is_even_K>(
+            // Transition from decoded to context: load the last context block.
+            // tKgKcontext points to block (actual_n_block_max_context - 1), so
+            // valid_count is the remainder of context tokens in that block.
+            flash::copy</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
                 gmem_tiled_copy_QKV, tKgKcontext, tKsK, tKVcKV, tKVpKV,
-                binfo.actual_seqlen_k_cache_context - n_block * kBlockN
+                binfo.actual_seqlen_k_cache_context - (actual_n_block_max_context - 1) * kBlockN
             );
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
@@ -742,7 +751,7 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
           //if (!is_first_nonmask_iter)
           //    __offset = -int(kBlockN * params.v_row_stride);
           //is_first_nonmask_iter = false;
-          __offset = n_block == (actual_n_block_max_context - 1) ? 0 : -int(kBlockN * params.v_row_stride);
+          __offset = n_block == (actual_n_block_max_context - 1) ? 0 : -int(kBlockN * params.vcontext_row_stride);
 
 
            if (block_table == nullptr) {
@@ -820,7 +829,7 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
             if (use_context == 1) {
                 // Advance gKcontext
                 if (block_table == nullptr) {
-                    tKgKcontext.data() = tKgKcontext.data() + (-int(kBlockN * params.k_row_stride));
+                    tKgKcontext.data() = tKgKcontext.data() + (-int(kBlockN * params.kcontext_row_stride));
                 } else {
 #ifndef DUALKV_ATTENTION_DISABLE_UNSUPPORTED_CODE
                     const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
