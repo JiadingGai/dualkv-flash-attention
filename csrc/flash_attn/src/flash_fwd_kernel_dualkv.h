@@ -68,13 +68,10 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
         ? n_split_idx * n_blocks_per_split
         : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     //(jiadingg): n_block_max is only used by dualkv flash attention under the scenario of flash decoding.
-    //int n_block_max = std::min(cute::ceil_div(binfo.seqlen_k_cache_context, kBlockN) + cute::ceil_div(binfo.seqlen_k_cache_decoded + binfo.actual_seqlen_q, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
-    int n_block_max = std::min(cute::ceil_div(params.seqlen_k_context, kBlockN) + cute::ceil_div(binfo.seqlen_k_cache_decoded + binfo.actual_seqlen_q, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
+    int n_block_max = std::min(cute::ceil_div(binfo.seqlen_k_cache_context, kBlockN) + cute::ceil_div(binfo.seqlen_k_cache_decoded + binfo.actual_seqlen_q, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
     if (Is_causal || Is_local) {
-        //n_block_max = std::min(n_block_max,
-        //                       cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
         n_block_max = std::min(n_block_max,
-                               cute::ceil_div((m_block + 1) * kBlockM + params.seqlen_k_context + binfo.seqlen_k_cache_decoded + params.window_size_right, kBlockN));
+                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
     }
 
     // dualkv attention
