@@ -72,7 +72,11 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
         ? n_split_idx * n_blocks_per_split
         : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     //(jiadingg): n_block_max is only used by dualkv flash attention under the scenario of flash decoding.
-    int n_block_max = std::min(cute::ceil_div(binfo.seqlen_k_cache_context, kBlockN) + cute::ceil_div(binfo.seqlen_k_cache_decoded + binfo.actual_seqlen_q, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
+    // Use actual_seqlen_k_cache_decoded (= seqlen_k_cache_decoded + seqlen_knew) instead of
+    // seqlen_k_cache_decoded + actual_seqlen_q.  When GQA triggers seqlenq_ngroups_swapped,
+    // actual_seqlen_q is inflated to ngroups while seqlen_knew stays at 1, which caused the
+    // old formula to over-count decoded blocks and access memory before the decoded buffer.
+    int n_block_max = std::min(cute::ceil_div(binfo.seqlen_k_cache_context, kBlockN) + cute::ceil_div(binfo.actual_seqlen_k_cache_decoded, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
