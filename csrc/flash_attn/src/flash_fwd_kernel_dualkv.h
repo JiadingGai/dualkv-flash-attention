@@ -684,7 +684,15 @@ inline __device__ void compute_attn_1rowblock_splitkv_dualkv(const Params &param
         // DUALKV ATTENTION:
         // (jiadingg) flash decoding:
         // n_block \in [actual_n_block_max_conext, actual_n_block_max_context + actual_n_block_max_decoded) are decoded block ids.
-        __copy_next_k_block();
+        // Guard: only prefetch next K block if there are more blocks to process.
+        // When num_splits > 1, a split may cover only 1 block; the pointer advance
+        // in __copy_next_k_block would go OOB (esp. for larget kBlockN like 256).
+        if (n_block - 1 >= n_block_min) {
+            __copy_next_k_block();
+        } else {
+            // Maintain the cp_async pipeline even when skipping the prefetch.
+            cute::cp_async_fence();
+        }
 
         // We have key_padding_mask so we'll need to Check_inf
         masking_step == 0

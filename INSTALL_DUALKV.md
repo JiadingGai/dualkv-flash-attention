@@ -11,6 +11,25 @@
 
 ---
 
+## Validated stack
+
+This branch has been validated with the following downstream stack for rollout
+generation in RL training:
+
+| Component | Version |
+|---|---|
+| dualkv-flash-attention branch | `gai_debug_flash_decoding_gxpo` |
+| vLLM | `v0.8.5` |
+| VERL | `v0.7.0` |
+
+Important integration note: the current DualKV kernel path expects separate
+context and decoded KV caches. vLLM `v0.8.5` still uses a single paged KV cache
+layout in its FlashAttention backend, so a custom interface layer on top of
+vLLM is required to route decode attention into `flash_attn_with_kvcache(...,
+use_dualkv_attention=True)`.
+
+---
+
 ## One-time system setup
 
 Install the Python development headers (required for compiling the C++ extension):
