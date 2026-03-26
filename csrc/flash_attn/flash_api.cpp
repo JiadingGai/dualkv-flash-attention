@@ -1642,16 +1642,33 @@ mha_fwd_kvcache_dualkv(at::Tensor &q,            // batch_size x seqlen_q x num_
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size_8 = round_multiple(head_size_og, 8);
+    const int head_size_rounded = head_size_8 <= 192 ? round_multiple(head_size_8, 32) : 256;
+    const bool needs_pad = head_size_og != head_size_rounded;
+    const int pad_amount = head_size_rounded - head_size_og;
+    // DualKV kernel requires Is_even_K (params.d == kHeadDim). When padding,
+    // set head_size = head_size_rounded so the kernel sees d == kHeadDim.
+    const int head_size = needs_pad ? head_size_rounded : head_size_8;
+
+    // DualKV kernel requires Is_even_K (head_size == kHeadDim). When the original
+    // head dim doesn't match the rounded kernel tile size, we pad all tensors to
+    // head_size_rounded so the kernel can run with Is_even_K=true.
     at::Tensor q_padded, kcache_padded, vcache_padded;
-    if (head_size_og % 8 != 0) {
-        assert(false && "dualkv flash attention is not tested for non-multiple-of-8 head size.");
-        // q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-        // kcache_padded = torch::nn::functional::pad(kcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-        // vcache_padded = torch::nn::functional::pad(vcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+    at::Tensor kcache_decoded_padded, vcache_decoded_padded;
+    if (needs_pad) {
+        auto pad_opts = torch::nn::functional::PadFuncOptions({0, pad_amount});
+        q_padded = torch::nn::functional::pad(q, pad_opts);
+        kcache_padded = torch::nn::functional::pad(kcache_context, pad_opts);
+        vcache_padded = torch::nn::functional::pad(vcache_context, pad_opts);
+        kcache_decoded_padded = torch::nn::functional::pad(kcache_decoded, pad_opts);
+        vcache_decoded_padded = torch::nn::functional::pad(vcache_decoded, pad_opts);
     } else {
         q_padded = q;
         kcache_padded = kcache_context;
         vcache_padded = vcache_context;
+        kcache_decoded_padded = kcache_decoded;
+        vcache_decoded_padded = vcache_decoded;
     }
 
     at::Tensor out;
@@ -1661,14 +1678,10 @@ mha_fwd_kvcache_dualkv(at::Tensor &q,            // batch_size x seqlen_q x num_
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);
-        if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
+        if (needs_pad) { out = torch::empty_like(q_padded); }
     } else {
         out = torch::empty_like(q_padded);
     }
-
-    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    const int head_size = round_multiple(head_size_og, 8);
-    const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
@@ -1708,25 +1721,25 @@ mha_fwd_kvcache_dualkv(at::Tensor &q,            // batch_size x seqlen_q x num_
 #endif
 
     params.use_dualkv_attention = use_dualkv_attention;
-    params.kcontext_ptr = kcache_context.data_ptr();
-    params.vcontext_ptr = vcache_context.data_ptr();
-    params.kdecoded_ptr = kcache_decoded.data_ptr();
-    params.vdecoded_ptr = vcache_decoded.data_ptr();
+    params.kcontext_ptr = kcache_padded.data_ptr();
+    params.vcontext_ptr = vcache_padded.data_ptr();
+    params.kdecoded_ptr = kcache_decoded_padded.data_ptr();
+    params.vdecoded_ptr = vcache_decoded_padded.data_ptr();
 
-    // All stride are in elements, not bytes.
-    params.kcontext_batch_stride = kcache_context.stride(0);
-    params.vcontext_batch_stride = vcache_context.stride(0);
-    params.kcontext_row_stride = kcache_context.stride(-3);
-    params.vcontext_row_stride = vcache_context.stride(-3);
-    params.kcontext_head_stride = kcache_context.stride(-2);
-    params.vcontext_head_stride = vcache_context.stride(-2);
+    // All stride are in elements, not bytes. Use padded tensors for correct strides.
+    params.kcontext_batch_stride = kcache_padded.stride(0);
+    params.vcontext_batch_stride = vcache_padded.stride(0);
+    params.kcontext_row_stride = kcache_padded.stride(-3);
+    params.vcontext_row_stride = vcache_padded.stride(-3);
+    params.kcontext_head_stride = kcache_padded.stride(-2);
+    params.vcontext_head_stride = vcache_padded.stride(-2);
 
-    params.kdecoded_batch_stride = kcache_decoded.stride(0);
-    params.vdecoded_batch_stride = vcache_decoded.stride(0);
-    params.kdecoded_row_stride = kcache_decoded.stride(-3);
-    params.vdecoded_row_stride = vcache_decoded.stride(-3);
-    params.kdecoded_head_stride = kcache_decoded.stride(-2);
-    params.vdecoded_head_stride = vcache_decoded.stride(-2);
+    params.kdecoded_batch_stride = kcache_decoded_padded.stride(0);
+    params.vdecoded_batch_stride = vcache_decoded_padded.stride(0);
+    params.kdecoded_row_stride = kcache_decoded_padded.stride(-3);
+    params.vdecoded_row_stride = vcache_decoded_padded.stride(-3);
+    params.kdecoded_head_stride = kcache_decoded_padded.stride(-2);
+    params.vdecoded_head_stride = vcache_decoded_padded.stride(-2);
 
     params.seqlen_k_context = kcache_context.size(1);
     params.seqlen_k_decoded = kcache_decoded.size(1);
@@ -1753,9 +1766,10 @@ mha_fwd_kvcache_dualkv(at::Tensor &q,            // batch_size x seqlen_q x num_
         int seqlen_knew = k.size(1);
         CHECK_SHAPE(k, batch_size, seqlen_knew, num_heads_k, head_size_og);
         CHECK_SHAPE(v, batch_size, seqlen_knew, num_heads_k, head_size_og);
-        if (head_size_og % 8 != 0) {
-            k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-            v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        if (needs_pad) {
+            auto pad_opts_kv = torch::nn::functional::PadFuncOptions({0, pad_amount});
+            k_padded = torch::nn::functional::pad(k, pad_opts_kv);
+            v_padded = torch::nn::functional::pad(v, pad_opts_kv);
         } else {
             k_padded = k;
             v_padded = v;
@@ -1860,20 +1874,19 @@ mha_fwd_kvcache_dualkv(at::Tensor &q,            // batch_size x seqlen_q x num_
     //print_params_dualkv(params);
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
-    // or paged KV cache
-    run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
+    // DualKV always needs the split kernel - the non-split kernel doesn't know about
+    // kcontext/kdecoded pointers and would silently produce wrong results.
+    run_mha_fwd(params, stream, /*force_split_kernel=*/true);
 
-    if (head_size_og % 8 != 0) {
-        assert(false && "dualkv flash attention is not tested for non-multiple-of-8 head size.");
-        //out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        //if (out_.has_value()) { out_.value().copy_(out); }
-        //if (k_.has_value()) {
-        //    // It's expensive to copy the KV cache here for the case where head size not divisible by 8,
-        //    // but we don't expect to get this case in practice. This is just so that the code works for that case.
-        //    kcache.copy_(kcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
-        //    vcache.copy_(vcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
-        //}
+    if (needs_pad) {
+        out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+        if (out_.has_value()) { out_.value().copy_(out); }
+        if (k_.has_value()) {
+            // Copy back the unpadded portion of the new KV that was appended to the decoded cache.
+            // The kernel wrote padded data into kcache_decoded_padded; copy back the valid head dims.
+            kcache_decoded.copy_(kcache_decoded_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
+            vcache_decoded.copy_(vcache_decoded_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
+        }
     }
 
     if (seqlenq_ngroups_swapped) {
