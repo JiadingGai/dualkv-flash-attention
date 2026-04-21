@@ -1473,6 +1473,313 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     return {out, softmax_lse};
 }
+// ===================== DualKV Training Forward =====================
+
+void run_mha_dualkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    FP16_SWITCH(!params.is_bf16, [&] {
+        HEADDIM_SWITCH(params.d, [&] {
+            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+                run_mha_fwd_dualkv_<elem_type, kHeadDim, Is_causal>(params, stream);
+            });
+        });
+    });
+}
+
+std::vector<at::Tensor>
+mha_dualkv_varlen_fwd(at::Tensor &q,              // total_q x num_heads x head_size
+                      const at::Tensor &k_context, // context_seqlen x num_heads_k x head_size
+                      const at::Tensor &v_context, // context_seqlen x num_heads_k x head_size
+                      const at::Tensor &k_decoded,  // total_k_decoded x num_heads_k x head_size (varlen packed)
+                      const at::Tensor &v_decoded,  // total_k_decoded x num_heads_k x head_size (varlen packed)
+                      std::optional<at::Tensor> &out_,
+                      const at::Tensor &cu_seqlens_q,       // b+1
+                      const at::Tensor &cu_seqlens_k_decoded, // b+1
+                      int max_seqlen_q,
+                      const int context_seqlen,    // shared context length (same for all seqs)
+                      const int max_seqlen_k_decoded,
+                      const float softmax_scale,
+                      bool is_causal) {
+
+    at::cuda::CUDAGuard device_guard{q.device()};
+
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    TORCH_CHECK(cc_major >= 8, "FlashAttention only supports Ampere GPUs or newer.");
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(k_context.dtype() == q_dtype, "k_context must have the same dtype as q");
+    TORCH_CHECK(v_context.dtype() == q_dtype, "v_context must have the same dtype as q");
+    TORCH_CHECK(k_decoded.dtype() == q_dtype, "k_decoded must have the same dtype as q");
+    TORCH_CHECK(v_decoded.dtype() == q_dtype, "v_decoded must have the same dtype as q");
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
+    TORCH_CHECK(cu_seqlens_k_decoded.dtype() == torch::kInt32, "cu_seqlens_k_decoded must have dtype int32");
+
+    CHECK_DEVICE(q); CHECK_DEVICE(k_context); CHECK_DEVICE(v_context);
+    CHECK_DEVICE(k_decoded); CHECK_DEVICE(v_decoded);
+    CHECK_DEVICE(cu_seqlens_q); CHECK_DEVICE(cu_seqlens_k_decoded);
+
+    TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
+    TORCH_CHECK(k_context.stride(-1) == 1, "k_context must have contiguous last dimension");
+    TORCH_CHECK(v_context.stride(-1) == 1, "v_context must have contiguous last dimension");
+    TORCH_CHECK(k_decoded.stride(-1) == 1, "k_decoded must have contiguous last dimension");
+    TORCH_CHECK(v_decoded.stride(-1) == 1, "v_decoded must have contiguous last dimension");
+    CHECK_CONTIGUOUS(cu_seqlens_q);
+    CHECK_CONTIGUOUS(cu_seqlens_k_decoded);
+
+    const int batch_size = cu_seqlens_q.numel() - 1;
+    const int total_q = q.size(0);
+    const int num_heads = q.size(1);
+    const int head_size = q.size(2);
+    const int num_heads_k = k_context.size(1);
+
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(head_size % 8 == 0, "head_size must be a multiple of 8");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    CHECK_SHAPE(q, total_q, num_heads, head_size);
+    CHECK_SHAPE(k_context, context_seqlen, num_heads_k, head_size);
+    CHECK_SHAPE(v_context, context_seqlen, num_heads_k, head_size);
+    TORCH_CHECK(k_decoded.size(1) == num_heads_k && k_decoded.size(2) == head_size);
+    TORCH_CHECK(v_decoded.size(1) == num_heads_k && v_decoded.size(2) == head_size);
+    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    CHECK_SHAPE(cu_seqlens_k_decoded, batch_size + 1);
+
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        CHECK_DEVICE(out);
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(out, total_q, num_heads, head_size);
+    } else {
+        out = torch::empty_like(q);
+    }
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size_rounded = round_multiple(head_size, head_size <= 128 ? 32 : 64);
+    const int max_seqlen_k = context_seqlen + max_seqlen_k_decoded;
+    const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
+    const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
+
+    auto opts = q.options();
+    auto softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+
+    Flash_fwd_params params;
+    set_params_fprop(params,
+                     batch_size,
+                     max_seqlen_q, max_seqlen_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     head_size, head_size_rounded,
+                     q, k_context, v_context, out,
+                     cu_seqlens_q.data_ptr(),
+                     nullptr,
+                     nullptr,
+                     nullptr,
+                     softmax_lse.data_ptr(),
+                     0.0f,
+                     softmax_scale,
+                     -1,
+                     is_causal ? 0 : -1,
+                     0.0f,
+                     false,
+                     true);
+    params.total_q = total_q;
+
+    params.use_dualkv_attention = true;
+
+    params.kcontext_ptr = k_context.data_ptr();
+    params.vcontext_ptr = v_context.data_ptr();
+    params.kcontext_row_stride = k_context.stride(0);
+    params.vcontext_row_stride = v_context.stride(0);
+    params.kcontext_head_stride = k_context.stride(1);
+    params.vcontext_head_stride = v_context.stride(1);
+    params.seqlen_k_context = context_seqlen;
+
+    params.kdecoded_ptr = k_decoded.data_ptr();
+    params.vdecoded_ptr = v_decoded.data_ptr();
+    params.kdecoded_row_stride = k_decoded.stride(0);
+    params.vdecoded_row_stride = v_decoded.stride(0);
+    params.kdecoded_head_stride = k_decoded.stride(1);
+    params.vdecoded_head_stride = v_decoded.stride(1);
+    params.seqlen_k_decoded = max_seqlen_k_decoded;
+    params.cu_seqlens_k_decoded = static_cast<int *>(cu_seqlens_k_decoded.data_ptr());
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    run_mha_dualkv_fwd(params, stream);
+
+    return {out, softmax_lse};
+}
+
+// ===================== DualKV Training Backward =====================
+
+void run_mha_dualkv_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+    FP16_SWITCH(!params.is_bf16, [&] {
+        HEADDIM_SWITCH(params.d, [&] {
+            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+                run_mha_bwd_dualkv_<elem_type, kHeadDim, Is_causal>(params, stream);
+            });
+        });
+    });
+}
+
+std::vector<at::Tensor>
+mha_dualkv_varlen_bwd(const at::Tensor &dout,
+                      const at::Tensor &q,
+                      const at::Tensor &k_context,
+                      const at::Tensor &v_context,
+                      const at::Tensor &k_decoded,
+                      const at::Tensor &v_decoded,
+                      const at::Tensor &out,
+                      const at::Tensor &softmax_lse,
+                      at::Tensor &dq,
+                      at::Tensor &dk_context,
+                      at::Tensor &dv_context,
+                      at::Tensor &dk_decoded,
+                      at::Tensor &dv_decoded,
+                      const at::Tensor &cu_seqlens_q,
+                      const at::Tensor &cu_seqlens_k_decoded,
+                      int max_seqlen_q,
+                      const int context_seqlen,
+                      const int max_seqlen_k_decoded,
+                      const float softmax_scale,
+                      bool is_causal) {
+
+    #ifdef FLASHATTENTION_DISABLE_BACKWARD
+        TORCH_CHECK(false, "This flash attention build does not support backward.");
+    #endif
+
+    at::cuda::CUDAGuard device_guard{q.device()};
+
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    TORCH_CHECK(cc_major >= 8, "FlashAttention only supports Ampere GPUs or newer.");
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16);
+    TORCH_CHECK(k_context.dtype() == q_dtype);
+    TORCH_CHECK(v_context.dtype() == q_dtype);
+    TORCH_CHECK(k_decoded.dtype() == q_dtype);
+    TORCH_CHECK(v_decoded.dtype() == q_dtype);
+
+    const int batch_size = cu_seqlens_q.numel() - 1;
+    const int total_q = q.size(0);
+    const int num_heads = q.size(1);
+    const int head_size = q.size(2);
+    const int num_heads_k = k_context.size(1);
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size_rounded = round_multiple(head_size, head_size <= 128 ? 32 : 64);
+    const int max_seqlen_k = context_seqlen + max_seqlen_k_decoded;
+    const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
+    const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
+
+    auto opts = q.options();
+
+    at::Tensor dk_context_expanded, dv_context_expanded;
+    at::Tensor dk_decoded_expanded, dv_decoded_expanded;
+    if (num_heads_k != num_heads) {
+        dk_context_expanded = torch::zeros({context_seqlen, num_heads, head_size}, opts);
+        dv_context_expanded = torch::zeros({context_seqlen, num_heads, head_size}, opts);
+        dk_decoded_expanded = torch::empty({k_decoded.size(0), num_heads, head_size}, opts);
+        dv_decoded_expanded = torch::empty({k_decoded.size(0), num_heads, head_size}, opts);
+    } else {
+        dk_context_expanded = dk_context;
+        dk_context_expanded.zero_();
+        dv_context_expanded = dv_context;
+        dv_context_expanded.zero_();
+        dk_decoded_expanded = dk_decoded;
+        dv_decoded_expanded = dv_decoded;
+    }
+
+    auto softmax_d = torch::empty({num_heads, total_q + 128 * batch_size}, opts.dtype(at::kFloat));
+    auto dq_accum = torch::empty({total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+
+    auto dk_context_accum = torch::zeros({context_seqlen, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+    auto dv_context_accum = torch::zeros({context_seqlen, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+
+    Flash_bwd_params params;
+    set_params_dgrad(params,
+                     batch_size,
+                     max_seqlen_q, max_seqlen_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     head_size, head_size_rounded,
+                     q, k_context, v_context, out,
+                     dout, dq, dk_context_expanded, dv_context_expanded,
+                     cu_seqlens_q.data_ptr(),
+                     nullptr,
+                     dq_accum.data_ptr(),
+                     nullptr,
+                     nullptr,
+                     softmax_lse.data_ptr(),
+                     softmax_d.data_ptr(),
+                     0.0f,
+                     softmax_scale,
+                     -1,
+                     is_causal ? 0 : -1,
+                     0.0f,
+                     false,
+                     true);
+    params.total_q = total_q;
+
+    params.use_dualkv_attention = true;
+
+    params.kcontext_ptr = k_context.data_ptr();
+    params.vcontext_ptr = v_context.data_ptr();
+    params.kcontext_row_stride = k_context.stride(0);
+    params.vcontext_row_stride = v_context.stride(0);
+    params.kcontext_head_stride = k_context.stride(1);
+    params.vcontext_head_stride = v_context.stride(1);
+    params.seqlen_k_context = context_seqlen;
+
+    params.kdecoded_ptr = k_decoded.data_ptr();
+    params.vdecoded_ptr = v_decoded.data_ptr();
+    params.kdecoded_row_stride = k_decoded.stride(0);
+    params.vdecoded_row_stride = v_decoded.stride(0);
+    params.kdecoded_head_stride = k_decoded.stride(1);
+    params.vdecoded_head_stride = v_decoded.stride(1);
+    params.seqlen_k_decoded = max_seqlen_k_decoded;
+    params.cu_seqlens_k_decoded = static_cast<int *>(cu_seqlens_k_decoded.data_ptr());
+
+    params.dk_context_ptr = dk_context_expanded.data_ptr();
+    params.dv_context_ptr = dv_context_expanded.data_ptr();
+    params.dk_context_row_stride = dk_context_expanded.stride(0);
+    params.dv_context_row_stride = dv_context_expanded.stride(0);
+    params.dk_context_head_stride = dk_context_expanded.stride(1);
+    params.dv_context_head_stride = dv_context_expanded.stride(1);
+
+    params.dk_decoded_ptr = dk_decoded_expanded.data_ptr();
+    params.dv_decoded_ptr = dv_decoded_expanded.data_ptr();
+    params.dk_decoded_row_stride = dk_decoded_expanded.stride(0);
+    params.dv_decoded_row_stride = dv_decoded_expanded.stride(0);
+    params.dk_decoded_head_stride = dk_decoded_expanded.stride(1);
+    params.dv_decoded_head_stride = dv_decoded_expanded.stride(1);
+
+    params.dk_context_accum_ptr = dk_context_accum.data_ptr();
+    params.dv_context_accum_ptr = dv_context_accum.data_ptr();
+    params.dk_context_accum_row_stride = dk_context_accum.stride(0);
+    params.dv_context_accum_row_stride = dv_context_accum.stride(0);
+    params.dk_context_accum_head_stride = dk_context_accum.stride(1);
+    params.dv_context_accum_head_stride = dv_context_accum.stride(1);
+
+    auto rng_state_tensor = torch::empty({2}, opts.dtype(torch::kInt64));
+    params.rng_state = reinterpret_cast<uint64_t*>(rng_state_tensor.data_ptr());
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    run_mha_dualkv_bwd(params, stream);
+
+    if (num_heads_k != num_heads) {
+        at::sum_out(dk_context, at::reshape(dk_context_expanded, {context_seqlen, num_heads_k, num_heads / num_heads_k, head_size}), {2});
+        at::sum_out(dv_context, at::reshape(dv_context_expanded, {context_seqlen, num_heads_k, num_heads / num_heads_k, head_size}), {2});
+        at::sum_out(dk_decoded, at::reshape(dk_decoded_expanded, {k_decoded.size(0), num_heads_k, num_heads / num_heads_k, head_size}), {2});
+        at::sum_out(dv_decoded, at::reshape(dv_decoded_expanded, {k_decoded.size(0), num_heads_k, num_heads / num_heads_k, head_size}), {2});
+    }
+
+    return { dq, dk_context, dv_context, dk_decoded, dv_decoded };
+}
+
 } // namespace FLASH_NAMESPACE
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1482,4 +1789,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bwd", &FLASH_NAMESPACE::mha_bwd, "Backward pass");
     m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");
+    m.def("dualkv_varlen_fwd", &FLASH_NAMESPACE::mha_dualkv_varlen_fwd, "DualKV forward pass (variable length, training)");
+    m.def("dualkv_varlen_bwd", &FLASH_NAMESPACE::mha_dualkv_varlen_bwd, "DualKV backward pass (variable length, training)");
 }

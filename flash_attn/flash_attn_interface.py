@@ -1625,3 +1625,143 @@ def flash_attn_with_kvcache(
         num_splits,
     )
     return (out, softmax_lse) if return_softmax_lse else out
+
+
+class FlashAttnDualKVVarlenFunc(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k_context,
+        v_context,
+        k_decoded,
+        v_decoded,
+        cu_seqlens_q,
+        cu_seqlens_k_decoded,
+        max_seqlen_q,
+        context_seqlen,
+        max_seqlen_k_decoded,
+        softmax_scale,
+        causal,
+        is_grad_enabled,
+    ):
+        is_grad = is_grad_enabled and any(
+            x.requires_grad for x in [q, k_context, v_context, k_decoded, v_decoded]
+        )
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        head_size_og = q.size(2)
+        if head_size_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
+            k_context = torch.nn.functional.pad(k_context, [0, 8 - head_size_og % 8])
+            v_context = torch.nn.functional.pad(v_context, [0, 8 - head_size_og % 8])
+            k_decoded = torch.nn.functional.pad(k_decoded, [0, 8 - head_size_og % 8])
+            v_decoded = torch.nn.functional.pad(v_decoded, [0, 8 - head_size_og % 8])
+        out, softmax_lse = flash_attn_gpu.dualkv_varlen_fwd(
+            q,
+            k_context,
+            v_context,
+            k_decoded,
+            v_decoded,
+            None,
+            cu_seqlens_q,
+            cu_seqlens_k_decoded,
+            max_seqlen_q,
+            context_seqlen,
+            max_seqlen_k_decoded,
+            softmax_scale,
+            causal,
+        )
+        if is_grad:
+            ctx.save_for_backward(
+                q, k_context, v_context, k_decoded, v_decoded,
+                out, softmax_lse, cu_seqlens_q, cu_seqlens_k_decoded
+            )
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.context_seqlen = context_seqlen
+            ctx.max_seqlen_k_decoded = max_seqlen_k_decoded
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+        return out[..., :head_size_og]
+
+    @staticmethod
+    def backward(ctx, dout):
+        (q, k_context, v_context, k_decoded, v_decoded,
+         out, softmax_lse, cu_seqlens_q, cu_seqlens_k_decoded) = ctx.saved_tensors
+        dout, q, k_context, v_context, k_decoded, v_decoded, out = [
+            maybe_contiguous(x) for x in (dout, q, k_context, v_context, k_decoded, v_decoded, out)
+        ]
+        head_size_og = dout.size(2)
+        dout_padded = dout
+        if head_size_og % 8 != 0:
+            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+        dq = torch.empty_like(q)
+        dk_context = torch.empty_like(k_context)
+        dv_context = torch.empty_like(v_context)
+        dk_decoded = torch.empty_like(k_decoded)
+        dv_decoded = torch.empty_like(v_decoded)
+        flash_attn_gpu.dualkv_varlen_bwd(
+            dout_padded,
+            q,
+            k_context,
+            v_context,
+            k_decoded,
+            v_decoded,
+            out,
+            softmax_lse,
+            dq,
+            dk_context,
+            dv_context,
+            dk_decoded,
+            dv_decoded,
+            cu_seqlens_q,
+            cu_seqlens_k_decoded,
+            ctx.max_seqlen_q,
+            ctx.context_seqlen,
+            ctx.max_seqlen_k_decoded,
+            ctx.softmax_scale,
+            ctx.causal,
+        )
+        dq = dq[..., :head_size_og]
+        dk_context = dk_context[..., :head_size_og]
+        dv_context = dv_context[..., :head_size_og]
+        dk_decoded = dk_decoded[..., :head_size_og]
+        dv_decoded = dv_decoded[..., :head_size_og]
+        return dq, dk_context, dv_context, dk_decoded, dv_decoded, None, None, None, None, None, None, None, None
+
+
+def flash_attn_dualkv_varlen_func(
+    q,
+    k_context,
+    v_context,
+    k_decoded,
+    v_decoded,
+    cu_seqlens_q,
+    cu_seqlens_k_decoded,
+    max_seqlen_q,
+    context_seqlen,
+    max_seqlen_k_decoded,
+    softmax_scale=None,
+    causal=False,
+):
+    """DualKV flash attention for training with variable-length sequences.
+
+    Context KV is shared across all sequences in the batch (shape: context_seqlen, nheads_k, headdim).
+    Decoded KV is per-sequence, packed with cu_seqlens (shape: total_k_decoded, nheads_k, headdim).
+    """
+    return FlashAttnDualKVVarlenFunc.apply(
+        q,
+        k_context,
+        v_context,
+        k_decoded,
+        v_decoded,
+        cu_seqlens_q,
+        cu_seqlens_k_decoded,
+        max_seqlen_q,
+        context_seqlen,
+        max_seqlen_k_decoded,
+        softmax_scale,
+        causal,
+        torch.is_grad_enabled(),
+    )

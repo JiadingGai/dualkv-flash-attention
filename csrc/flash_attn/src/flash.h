@@ -140,6 +140,28 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+
+    // DualKV forward: separate context and decoded KV
+    bool use_dualkv_attention;
+
+    void *__restrict__ kcontext_ptr;
+    void *__restrict__ vcontext_ptr;
+    void *__restrict__ kdecoded_ptr;
+    void *__restrict__ vdecoded_ptr;
+
+    index_t kcontext_row_stride;
+    index_t vcontext_row_stride;
+    index_t kcontext_head_stride;
+    index_t vcontext_head_stride;
+
+    index_t kdecoded_row_stride;
+    index_t vdecoded_row_stride;
+    index_t kdecoded_head_stride;
+    index_t vdecoded_head_stride;
+
+    int seqlen_k_context;
+    int seqlen_k_decoded;
+    int * __restrict__ cu_seqlens_k_decoded;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -182,6 +204,36 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     bool deterministic;
     index_t dq_accum_split_stride;
+
+    // DualKV backward: separate gradient outputs for context and decoded KV
+    void *__restrict__ dk_context_ptr;
+    void *__restrict__ dv_context_ptr;
+    void *__restrict__ dk_decoded_ptr;
+    void *__restrict__ dv_decoded_ptr;
+
+    // Strides for context gradient outputs (1, seqlen_k_context, nheads_k, headdim)
+    index_t dk_context_batch_stride;
+    index_t dv_context_batch_stride;
+    index_t dk_context_row_stride;
+    index_t dv_context_row_stride;
+    index_t dk_context_head_stride;
+    index_t dv_context_head_stride;
+
+    // Strides for decoded gradient outputs (batch_size, seqlen_k_decoded, nheads_k, headdim)
+    index_t dk_decoded_batch_stride;
+    index_t dv_decoded_batch_stride;
+    index_t dk_decoded_row_stride;
+    index_t dv_decoded_row_stride;
+    index_t dk_decoded_head_stride;
+    index_t dv_decoded_head_stride;
+
+    // fp32 accumulation buffers for context dK/dV (avoids fp16 atomicAdd precision loss)
+    void *__restrict__ dk_context_accum_ptr;
+    void *__restrict__ dv_context_accum_ptr;
+    index_t dk_context_accum_row_stride;
+    index_t dv_context_accum_row_stride;
+    index_t dk_context_accum_head_stride;
+    index_t dv_context_accum_head_stride;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -190,5 +242,9 @@ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_pa
 template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+
+// DualKV training kernels
+template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_dualkv_(Flash_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_dualkv_(Flash_bwd_params &params, cudaStream_t stream);
 
 }  // namespace FLASH_NAMESPACE
