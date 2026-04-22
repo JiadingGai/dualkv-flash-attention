@@ -355,9 +355,9 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_bwd_hdim256_bf16_causal_sm80.cu",
                 # split-KV kernels replaced with stub to speed up build
                 "csrc/flash_attn/src/flash_fwd_split_stub.cu",
-                # DualKV bf16/hdim32 stubs (unsupported combos)
+                # DualKV hdim32 stubs (unsupported combos)
                 "csrc/flash_attn/src/flash_dualkv_stub.cu",
-                # DualKV training forward kernels (fp16 only)
+                # DualKV training forward kernels (fp16)
                 "csrc/flash_attn/src/flash_fwd_dualkv_hdim64_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_dualkv_hdim64_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_dualkv_hdim96_fp16_sm80.cu",
@@ -368,7 +368,18 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_dualkv_hdim192_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_dualkv_hdim256_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_dualkv_hdim256_fp16_causal_sm80.cu",
-                # DualKV training backward kernels (fp16 only)
+                # DualKV training forward kernels (bf16)
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim64_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim64_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim96_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim96_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim128_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim128_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim192_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim192_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim256_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_dualkv_hdim256_bf16_causal_sm80.cu",
+                # DualKV training backward kernels (fp16)
                 "csrc/flash_attn/src/flash_bwd_dualkv_hdim64_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_dualkv_hdim64_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_dualkv_hdim96_fp16_sm80.cu",
@@ -379,6 +390,17 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_bwd_dualkv_hdim192_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_dualkv_hdim256_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_dualkv_hdim256_fp16_causal_sm80.cu",
+                # DualKV training backward kernels (bf16)
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim64_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim64_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim96_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim96_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim128_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim128_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim192_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim192_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim256_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_bwd_dualkv_hdim256_bf16_causal_sm80.cu",
             ],
             extra_compile_args={
                 "cxx": compiler_c17_flag,
